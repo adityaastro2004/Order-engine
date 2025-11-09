@@ -1,0 +1,28 @@
+version: '3.8'
+
+# This section defines the services (containers) we want to run.
+services:
+  # This is the PostgreSQL DB service.
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: order_execution
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # This is the Redis service.
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+# This section defines the volumes used for data persistence.
+volumes:
+  postgres_data:
+  redis_data:
