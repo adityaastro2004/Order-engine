@@ -4,7 +4,11 @@ import { randomUUID } from 'crypto';
 import websocketPlugin from '@fastify/websocket';
 import { WebSocket } from 'ws';
 import dotenv from 'dotenv';
+import { createRequire } from 'module';
 dotenv.config();
+
+const require = createRequire(import.meta.url);
+const IORedis = require("ioredis");
 
 const server = Fastify({ logger: true });
 server.register(websocketPlugin);
@@ -14,6 +18,22 @@ const orderQueue = new Queue('orderqueue', {
         host: 'localhost',
         port: 6379
     }
+});
+
+// Create a Redis subscriber to listen for order updates from the worker
+const redisSubscriber = new IORedis({ host: 'localhost', port: 6379 });
+
+// Add connection event listeners
+redisSubscriber.on('connect', () => {
+    console.log('[SERVER] Redis subscriber connected successfully!');
+});
+
+redisSubscriber.on('ready', () => {
+    console.log('[SERVER] Redis subscriber is ready!');
+});
+
+redisSubscriber.on('error', (err: any) => {
+    console.error('[SERVER] Redis subscriber error:', err);
 });
 
 const activeConnections = new Map<string, WebSocket>();
@@ -61,14 +81,74 @@ server.register(async function (fastify) {
         // Store the connection so the worker can send updates to it later.
         activeConnections.set(orderId, socket as WebSocket);
         
-        socket.send(JSON.stringify({ orderId, status: "subscribed", message: "You are now subscribed to order status updates." }));
+        // Subscribe to this specific order's updates channel
+        redisSubscriber.subscribe(`order-updates:${orderId}`, (err: any) => {
+            if (err) {
+                server.log.error(`[${orderId}] Failed to subscribe to Redis channel: ${err}`);
+            } else {
+                server.log.info(`[${orderId}] Subscribed to order updates channel.`);
+            }
+        });
+        
+        // Send initial pending status
+        socket.send(JSON.stringify({ 
+            orderId, 
+            status: "pending", 
+            message: "Order received and queued for processing." 
+        }));
 
         // When the client disconnects, remove them from our map to prevent memory leaks.
         socket.on('close', () => {
             activeConnections.delete(orderId);
+            redisSubscriber.unsubscribe(`order-updates:${orderId}`);
             server.log.info(`[${orderId}] WebSocket client disconnected.`);
         });
     });
+});
+
+// Listen for messages from Redis and forward them to the appropriate WebSocket client
+redisSubscriber.on('message', (channel: string, message: string) => {
+    console.log(`[REDIS] Received message on channel: ${channel}`);
+    console.log(`[REDIS] Message content: ${message}`);
+    
+    try {
+        // Extract orderId from channel name (format: "order-updates:orderId")
+        const parts = channel.split(':');
+        const orderId = parts[1];
+        
+        if (!orderId) {
+            server.log.warn(`Invalid channel format: ${channel}`);
+            return;
+        }
+        
+        server.log.info({ channel, message }, `Received message from Redis for order ${orderId}`);
+        
+        const update = JSON.parse(message);
+        
+        // Find the correct WebSocket connection for this orderId
+        const socket = activeConnections.get(orderId);
+        
+        console.log(`[REDIS] Socket exists: ${!!socket}, Socket state: ${socket?.readyState}`);
+
+        if (socket && socket.readyState === socket.OPEN) {
+            // Send the update to the client
+            const payload = JSON.stringify({ orderId, ...update });
+            console.log(`[REDIS] Sending to client: ${payload}`);
+            socket.send(payload);
+            server.log.info(`[${orderId}] Sent status update to client: ${update.status}`);
+
+            // If the order is finished, we can close the connection.
+            if (update.status === 'confirmed' || update.status === 'failed') {
+                setTimeout(() => {
+                    socket.close();
+                }, 1000); // Give client 1 second to receive the final message
+            }
+        } else {
+            server.log.warn(`[${orderId}] No active WebSocket connection found for this order.`);
+        }
+    } catch (error) {
+        server.log.error('Error processing message from Redis: ' + error);
+    }
 });
 
 
