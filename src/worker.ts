@@ -1,4 +1,5 @@
 import { Worker } from "bullmq";
+import { MockDexRouter } from "./services/DEXrouter.js";
 
 console.log("Worker starting...");
 
@@ -9,13 +10,26 @@ const orderWorker = new Worker('orderqueue', async job => {
   
   console.log(`[${orderId}] Processing order: Swap ${amount} ${tokenIn} for ${tokenOut}`);
   
-  // Simulate doing some work (e.g., calling a DEX)
-  await sleep(3000); // Wait for 3 seconds
+  const router = new MockDexRouter();
+
+  // We use Promise.all to fetch both quotes concurrently to save time.
+  console.log(`[${orderId}] STAGE: ROUTING - Fetching quotes...`);
+  const [raydiumQuote, meteoraQuote] = await Promise.all([
+      router.getRaydiumQuote(tokenIn, tokenOut, amount),
+      router.getMeteoraQuote(tokenIn, tokenOut, amount)
+  ]);
+
+  const bestQuote = raydiumQuote.price > meteoraQuote.price ? raydiumQuote : meteoraQuote;
   
-  // DEX routing will come here.
+  // This is a required deliverable: Log the routing decision for transparency.
+  console.log(`[${orderId}] STAGE: ROUTING - Decision: ${bestQuote.dex} offered the best price (${bestQuote.price}).`);
+
+  console.log(`[${orderId}] STAGE: BUILDING & SUBMITTING - Executing swap...`);
+  const result = await router.executeSwap(bestQuote.dex, tokenIn, tokenOut, amount, bestQuote.price);
   
-  console.log(`[${orderId}] Finished processing.`);
-  return { status: 'Completed', timestamp: new Date() };
+  console.log(`[${orderId}] STAGE: CONFIRMED - Transaction successful.`);
+  return { status: 'Completed', ...result };
+  
 }, {
   connection: {
     host: 'localhost',
