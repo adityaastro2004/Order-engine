@@ -1,6 +1,7 @@
 import { Worker } from "bullmq";
 import { MockDexRouter } from "./services/DEXrouter.js";
 import { createRequire } from 'module';
+import { saveOrderStatus } from './db.js';
 
 const require = createRequire(import.meta.url);
 const IORedis = require("ioredis");
@@ -21,6 +22,11 @@ publisher.on('error', (err: any) => {
     console.error('[WORKER] Redis connection error:', err);
 });
 
+// Initialize DEX router globally (singleton pattern)
+// Since MockDexRouter methods are stateless, we can reuse a single instance
+// across all job processing, reducing memory allocation overhead
+const router = new MockDexRouter();
+
 console.log("Worker process started.");
 
 const orderWorker = new Worker('orderqueue', async job => {
@@ -34,8 +40,6 @@ const orderWorker = new Worker('orderqueue', async job => {
   // Give the WebSocket client a moment to connect and subscribe
   console.log(`[${orderId}] Waiting for WebSocket client to connect...`);
   await new Promise(res => setTimeout(res, 10000)); // Wait 10 seconds
-  
-  const router = new MockDexRouter();
 
   // STAGE 1: ROUTING
   // Announce that we are starting the routing process.
@@ -44,6 +48,13 @@ const orderWorker = new Worker('orderqueue', async job => {
       status: 'routing', 
       message: 'Comparing DEX prices...' 
   }));
+  await saveOrderStatus(orderId, { 
+      status: 'routing',
+      tokenIn,
+      tokenOut,
+      amount
+  });
+  
   const [raydiumQuote, meteoraQuote] = await Promise.all([
       router.getRaydiumQuote(tokenIn, tokenOut, amount),
       router.getMeteoraQuote(tokenIn, tokenOut, amount)
@@ -58,6 +69,13 @@ const orderWorker = new Worker('orderqueue', async job => {
       status: 'building', 
       message: `Creating transaction for ${bestQuote.dex}...` 
   }));
+  await saveOrderStatus(orderId, { 
+      status: 'building', 
+      dex: bestQuote.dex,
+      tokenIn,
+      tokenOut,
+      amount
+  });
   
   // STAGE 3: SUBMITTED
   // We add a small artificial delay to make the UI feel more natural.
@@ -67,6 +85,12 @@ const orderWorker = new Worker('orderqueue', async job => {
       status: 'submitted', 
       message: 'Transaction sent to network, awaiting confirmation.' 
   }));
+  await saveOrderStatus(orderId, { 
+      status: 'submitted',
+      tokenIn,
+      tokenOut,
+      amount
+  });
   
   // This call simulates the network confirmation time.
   const result = await router.executeSwap(bestQuote.dex, tokenIn, tokenOut, amount, bestQuote.price);
@@ -78,6 +102,15 @@ const orderWorker = new Worker('orderqueue', async job => {
       status: 'confirmed', 
       data: result 
   }));
+  await saveOrderStatus(orderId, { 
+      status: 'confirmed',
+      txHash: result.txHash,
+      executedPrice: result.executedPrice,
+      dex: bestQuote.dex,
+      tokenIn,
+      tokenOut,
+      amount
+  });
 
   console.log(`[${orderId}] Processing finished.`);
   return { status: 'Completed', ...result };
@@ -110,6 +143,18 @@ orderWorker.on('failed', async (job, err) => {
       status: 'failed',
       error: err.message
   }));
+  
+  // Save failed status to database
+  if (job) {
+    await saveOrderStatus(orderId, { 
+        status: 'failed',
+        errorMessage: err.message,
+        tokenIn: job.data.tokenIn,
+        tokenOut: job.data.tokenOut,
+        amount: job.data.amount
+    });
+  }
+  
   console.log(`----------------------------------------------------`);
 });
 

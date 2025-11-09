@@ -5,6 +5,7 @@ import websocketPlugin from '@fastify/websocket';
 import { WebSocket } from 'ws';
 import dotenv from 'dotenv';
 import { createRequire } from 'module';
+import { initDatabase, saveOrderStatus, getOrderById } from './db.js';
 dotenv.config();
 
 const require = createRequire(import.meta.url);
@@ -51,6 +52,18 @@ server.post('/api/order/execute', async (request, reply) => {
             return reply.status(400).send({ message: "Invalid order data. Required fields: tokenIn, tokenOut, amount" });
         }
 
+        // Save initial order to database
+        await saveOrderStatus(orderId, {
+            tokenIn: orderData.tokenIn,
+            tokenOut: orderData.tokenOut,
+            amount: orderData.amount,
+            status: 'pending',
+            dex: null,
+            executedPrice: null,
+            txHash: null,
+            errorMessage: null
+        });
+
         await orderQueue.add('market-queue', { orderId, ...orderData });
         
         server.log.info(`[${orderId}] Order successfully added to the queue via POST.`);
@@ -66,7 +79,7 @@ server.post('/api/order/execute', async (request, reply) => {
 
 
 server.register(async function (fastify) {
-    fastify.get('/api/order/status', { websocket: true }, (socket, request) => {
+    fastify.get('/api/order/status', { websocket: true }, async (socket, request) => {
         const orderId = (request.query as any)?.orderId;
         
         if (!orderId) {
@@ -77,6 +90,29 @@ server.register(async function (fastify) {
         }
 
         server.log.info(`[${orderId}] WebSocket client connected.`);
+        
+        // Check if order already exists and is completed
+        const existingOrder = await getOrderById(orderId);
+        
+        if (existingOrder) {
+            if (existingOrder.status === 'confirmed' || existingOrder.status === 'failed') {
+                // Order is already completed, send final status and close
+                server.log.info(`[${orderId}] Order already completed. Sending final status.`);
+                socket.send(JSON.stringify({
+                    orderId,
+                    status: existingOrder.status,
+                    message: existingOrder.status === 'confirmed' ? 'Order already completed.' : 'Order failed.',
+                    data: existingOrder.status === 'confirmed' ? {
+                        txHash: existingOrder.tx_hash,
+                        executedPrice: parseFloat(existingOrder.executed_price),
+                        dex: existingOrder.dex
+                    } : undefined,
+                    error: existingOrder.error_message
+                }));
+                socket.close();
+                return;
+            }
+        }
         
         // Store the connection so the worker can send updates to it later.
         activeConnections.set(orderId, socket as WebSocket);
@@ -154,6 +190,10 @@ redisSubscriber.on('message', (channel: string, message: string) => {
 
 const start = async () => {
     try {
+        // Initialize database and create tables
+        await initDatabase();
+        server.log.info('Database initialized successfully');
+        
         await server.listen({ port: Number(process.env.PORT) || 3000, host: '0.0.0.0' });
     } catch (err) {
         server.log.error(err);
