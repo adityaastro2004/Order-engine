@@ -14,15 +14,18 @@ const IORedis = require("ioredis");
 const server = Fastify({ logger: true });
 server.register(websocketPlugin);
 
+// Redis connection configuration (supports both local and Docker environments)
+const redisConfig = {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379')
+};
+
 const orderQueue = new Queue('orderqueue', {
-    connection: {
-        host: 'localhost',
-        port: 6379
-    }
+    connection: redisConfig
 });
 
 // Create a Redis subscriber to listen for order updates from the worker
-const redisSubscriber = new IORedis({ host: 'localhost', port: 6379 });
+const redisSubscriber = new IORedis(redisConfig);
 
 // Add connection event listeners
 redisSubscriber.on('connect', () => {

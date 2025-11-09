@@ -4,12 +4,13 @@ const require = createRequire(import.meta.url);
 const { Pool } = require('pg');
 
 // Create a PostgreSQL connection pool
+// Uses environment variables for Docker compatibility, falls back to localhost for local development
 export const pool = new Pool({
-    host: 'localhost',
-    port: 5432,
-    database: 'order_execution',
-    user: 'user',
-    password: 'password',
+    host: process.env.POSTGRES_HOST || 'localhost',
+    port: parseInt(process.env.POSTGRES_PORT || '5432'),
+    database: process.env.POSTGRES_DB || 'order_execution',
+    user: process.env.POSTGRES_USER || 'user',
+    password: process.env.POSTGRES_PASSWORD || 'password',
 });
 
 // Initialize the database table

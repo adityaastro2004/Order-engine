@@ -6,12 +6,15 @@ import { saveOrderStatus } from './db.js';
 const require = createRequire(import.meta.url);
 const IORedis = require("ioredis");
 
-// Create a Redis client dedicated to publishing status updates.
-const publisher = new IORedis({
-    host: 'localhost',
-    port: 6379,
+// Redis connection configuration (supports both local and Docker environments)
+const redisConfig = {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379'),
     maxRetriesPerRequest: null
-});
+};
+
+// Create a Redis client dedicated to publishing status updates.
+const publisher = new IORedis(redisConfig);
 
 // Add connection event listeners
 publisher.on('connect', () => {
@@ -116,10 +119,7 @@ const orderWorker = new Worker('orderqueue', async job => {
   return { status: 'Completed', ...result };
 
 }, {
-  connection: {
-    host: 'localhost',
-    port: 6379
-  },
+  connection: redisConfig,
   concurrency: 10 
 });
 

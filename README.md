@@ -388,36 +388,180 @@ If you connect to a WebSocket after the order is completed, the server will:
 
 This ensures clients can always retrieve order status, even if they connect after processing.
 
-## 🐳 Docker Services
+## 🐳 Docker Architecture
 
-The application requires Redis and PostgreSQL, managed via Docker Compose:
+The application is fully containerized with 4 services orchestrated by Docker Compose:
 
-### Services Configuration
+### Services Overview
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| **postgres** | postgres:13 | 5432 | PostgreSQL database for order persistence |
+| **redis** | redis:7 | 6379 | Redis for BullMQ job queue and pub/sub messaging |
+| **server** | Custom (Node.js 22) | 3000 | Fastify API server with WebSocket support |
+| **worker** | Custom (Node.js 22) | - | BullMQ worker for order processing |
+
+### Docker Compose Configuration
 
 ```yaml
+version: '3.8'
+
 services:
   postgres:
     image: postgres:13
     ports: 5432:5432
-    credentials:
-      - user: user
-      - password: password
-      - database: order_execution
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: order_execution
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d order_execution"]
+      interval: 10s
+    networks:
+      - order_engine_network
 
   redis:
     image: redis:7
     ports: 6379:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+    networks:
+      - order_engine_network
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports: 3000:3000
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: npm start
+    networks:
+      - order_engine_network
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: npm run worker
+    networks:
+      - order_engine_network
+
+networks:
+  order_engine_network:
+    driver: bridge
+```
+
+### Key Docker Features
+
+1. **Health Checks**: Ensures PostgreSQL and Redis are ready before starting server/worker
+2. **Shared Network**: All containers communicate via `order_engine_network` bridge
+3. **Service Discovery**: Containers reference each other by service name (e.g., `redis`, `postgres`)
+4. **Volume Persistence**: Database and Redis data persisted across container restarts
+5. **Single Dockerfile**: Both server and worker built from same image, different commands
+
+### Environment Variables
+
+The application uses environment variables for configuration, supporting both local and Docker deployments:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | 3000 | Server port |
+| `REDIS_HOST` | localhost | Redis hostname (use `redis` in Docker) |
+| `REDIS_PORT` | 6379 | Redis port |
+| `POSTGRES_HOST` | localhost | PostgreSQL hostname (use `postgres` in Docker) |
+| `POSTGRES_PORT` | 5432 | PostgreSQL port |
+| `POSTGRES_DB` | order_execution | Database name |
+| `POSTGRES_USER` | user | Database user |
+| `POSTGRES_PASSWORD` | password | Database password |
+
+**How fallbacks work:**
+```typescript
+// Code automatically detects environment
+const host = process.env.POSTGRES_HOST || 'localhost';
+// In Docker: uses 'postgres'
+// Local dev: uses 'localhost'
 ```
 
 ## 🚦 Getting Started
 
 ### Prerequisites
 
-- Node.js v22.13.1 or higher
-- Docker and Docker Compose
-- npm or yarn package manager
+- **For Docker deployment (Recommended):**
+  - Docker and Docker Compose
+  
+- **For local development:**
+  - Node.js v22.13.1 or higher
+  - Docker and Docker Compose (for PostgreSQL and Redis)
+  - npm or yarn package manager
 
 ### Installation
+
+#### Option 1: Docker Deployment (Fully Containerized) ⭐
+
+This is the recommended approach - runs everything in containers with zero local Node.js setup required.
+
+1. **Clone the repository**
+   ```bash
+   cd order_engine
+   ```
+
+2. **Start all services with Docker Compose**
+   ```bash
+   docker-compose up -d
+   ```
+
+3. **Verify all containers are running**
+   ```bash
+   docker ps
+   ```
+   You should see 4 containers:
+   - `order_engine-postgres-1` - PostgreSQL database
+   - `order_engine-redis-1` - Redis cache/pub-sub
+   - `order_engine-server-1` - Fastify API server
+   - `order_engine-worker-1` - BullMQ worker process
+
+4. **View logs (optional)**
+   ```bash
+   # All services
+   docker-compose logs -f
+   
+   # Specific service
+   docker-compose logs -f server
+   docker-compose logs -f worker
+   ```
+
+5. **Stop all services**
+   ```bash
+   docker-compose down
+   ```
+
+6. **Stop and remove all data (clean slate)**
+   ```bash
+   docker-compose down -v
+   ```
+
+**How it works:**
+- Server and worker share the same Docker image (built from `Dockerfile`)
+- Different `command` overrides in `docker-compose.yml` determine which script runs
+- All services communicate via internal `order_engine_network`
+- PostgreSQL and Redis data persisted in Docker volumes
+- Health checks ensure services start in correct order
+
+#### Option 2: Local Development Mode
+
+Run the application locally while using Docker only for PostgreSQL and Redis.
 
 1. **Clone the repository**
    ```bash
@@ -429,18 +573,18 @@ services:
    npm install
    ```
 
-3. **Start Docker services**
+3. **Start Docker services (PostgreSQL & Redis only)**
    ```bash
-   docker-compose up -d
+   docker-compose up -d postgres redis
    ```
 
 4. **Verify services are running**
    ```bash
    docker ps
    ```
-   You should see both `postgres` and `redis` containers running.
+   You should see `postgres` and `redis` containers running.
 
-### Running the Application
+### Running the Application (Local Mode)
 
 The application requires two processes running simultaneously:
 
@@ -844,6 +988,91 @@ npm install ioredis
 npm install --save-dev @types/node
 ```
 
+### Docker-specific issues
+
+**Issue**: Container exits immediately after starting
+
+**Root Cause:** Application crashes due to missing dependencies or connection failures.
+
+**Solution:**
+```bash
+# View logs to see error
+docker-compose logs server
+docker-compose logs worker
+
+# Rebuild containers
+docker-compose up -d --build
+```
+
+**Issue**: `Cannot connect to redis/postgres` from containers
+
+**Root Cause:** Using `localhost` instead of service names in Docker network.
+
+**Solution:** Environment variables automatically handle this - verify they're set correctly in docker-compose.yml:
+```yaml
+environment:
+  REDIS_HOST: redis      # ✅ Service name, not localhost
+  POSTGRES_HOST: postgres # ✅ Service name, not localhost
+```
+
+**Issue**: Port already in use (3000, 5432, or 6379)
+
+**Root Cause:** Another service using the same port.
+
+**Solution:**
+```bash
+# Option 1: Stop conflicting service
+docker ps  # Find container ID
+docker stop <container-id>
+
+# Option 2: Change port in docker-compose.yml
+ports:
+  - "3001:3000"  # Map external 3001 to internal 3000
+```
+
+**Issue**: Changes to code not reflected in container
+
+**Root Cause:** Docker image needs to be rebuilt.
+
+**Solution:**
+```bash
+# Stop, rebuild, and restart
+docker-compose down
+docker-compose up -d --build
+
+# Or rebuild specific service
+docker-compose build server
+docker-compose up -d server
+```
+
+**Issue**: Database tables not created automatically
+
+**Root Cause:** Server started before database was ready (health check failed).
+
+**Solution:**
+```bash
+# Check health status
+docker-compose ps
+
+# Restart server if postgres wasn't ready
+docker-compose restart server
+```
+
+**Issue**: Worker not processing jobs in Docker
+
+**Root Cause:** Worker container not running or can't connect to Redis.
+
+**Solution:**
+```bash
+# Check worker status
+docker-compose ps worker
+
+# View worker logs
+docker-compose logs -f worker
+
+# Should see: "[WORKER] Connected to Redis successfully!"
+```
+
 ## 📊 Performance Notes
 
 - **Worker Concurrency**: Set to 10 concurrent jobs (configurable in worker.ts)
@@ -885,7 +1114,113 @@ const orderWorker = new Worker('orderqueue', async job => {
 - With 10 concurrent jobs: ~1-5 KB constant savings
 - At high volume (1000 orders/min): Prevents ~16,000 object allocations per minute
 
-## 🔄 Future Enhancements
+## � Docker Command Reference
+
+Quick reference for common Docker operations:
+
+### Starting and Stopping
+
+```bash
+# Start all services
+docker-compose up -d
+
+# Start specific service
+docker-compose up -d server
+
+# Stop all services
+docker-compose down
+
+# Stop and remove volumes (clean slate)
+docker-compose down -v
+```
+
+### Viewing Logs
+
+```bash
+# All services (follow mode)
+docker-compose logs -f
+
+# Specific service
+docker-compose logs -f server
+docker-compose logs -f worker
+
+# Last 100 lines
+docker-compose logs --tail=100 server
+```
+
+### Rebuilding
+
+```bash
+# Rebuild all services
+docker-compose up -d --build
+
+# Rebuild specific service
+docker-compose build server
+docker-compose up -d server
+
+# Force rebuild without cache
+docker-compose build --no-cache
+```
+
+### Container Management
+
+```bash
+# List running containers
+docker-compose ps
+
+# Restart service
+docker-compose restart server
+
+# Execute command in container
+docker-compose exec server sh
+docker-compose exec postgres psql -U user -d order_execution
+
+# View resource usage
+docker stats
+```
+
+### Debugging
+
+```bash
+# Check container health
+docker-compose ps
+
+# Inspect container
+docker inspect order_engine-server-1
+
+# View container logs (raw)
+docker logs order_engine-server-1
+
+# Access Redis CLI
+docker-compose exec redis redis-cli
+> PING
+> KEYS *
+> GET key_name
+
+# Access PostgreSQL CLI
+docker-compose exec postgres psql -U user -d order_execution
+\dt                    # List tables
+SELECT * FROM orders;  # Query orders
+\q                     # Quit
+```
+
+### Cleanup
+
+```bash
+# Remove stopped containers
+docker-compose rm
+
+# Remove all unused images
+docker image prune -a
+
+# Remove all unused volumes
+docker volume prune
+
+# Complete cleanup (dangerous!)
+docker system prune -a --volumes
+```
+
+## �🔄 Future Enhancements
 
 - [ ] Real DEX integration (Raydium/Meteora SDKs)
 - [ ] Authentication and user management
